@@ -1,0 +1,206 @@
+### класс/функцию работы с Qdrant он же embeddings:
+
+```
+load_dotenv()
+
+qdrant_client = QdrantClient(
+    url=os.getenv("QDRANT_URL"), 
+    api_key=os.getenv("QDRANT_KEY"),
+)
+
+COLLECTION = "MTZ-82"
+#print(qdrant_client.get_collections())
+
+query_text = "Нужен мотор гидравлический"
+model = SentenceTransformer("ai-forever/ru-en-RoSBERTa")
+def QueryFinder(query: str, collection: str) -> dict:
+    """
+    Ищет запрос в векторной БД
+    
+    Returns: dict
+    Возвращает словарь, где "Part" - похожая деталь, а "text" - остальные детали в группе
+    """
+    query_vector = model.encode(query if query else query_text)
+    # search for similar menu items
+    results = qdrant_client.query_points(
+        collection_name=COLLECTION,
+        query=query_vector,
+        with_payload=True,
+        limit=3
+    )
+    #res = [i for i in results]
+    #print(res[0][1].payload)
+    #print(res[0].payload)
+    # print results
+    payload = ""
+    print("\n🔍 Топ-3 результата:")
+    for point in results.points:
+        print(f"Это найдено в векторной Бд {point}")
+    # 1. Если это ScoredPoint
+        if hasattr(point, 'payload'):
+            payload = point.payload or {}
+        # 2. Если это кортеж вида (id, score, payload) или (score, payload)
+        elif isinstance(point, (tuple, list)):
+            payload = point[0] if len(point) >= 1 else {}
+        else:
+            payload = {"text": "", "Part": "Ничего не найдено"}
+        return payload
+    return payload
+```
+
+### основные system prompts; функцию, которая получает запрос пользователя и формирует финальный ответ;
+
+```
+import streamlit as st
+from ollama import chat, ChatResponse, Client
+from openai import OpenAI
+from qdrant.findInQdrant import QueryFinder
+
+load_dotenv()
+
+from modules.check_internet import checkInternet
+
+if 'local' not in st.session_state:
+    st.session_state['local'] = None
+
+ADD_TO_EXPERT_ANSWER = ""
+
+models = {
+    "local": {
+        "mini": 'gemma4:e4b',
+        "big": 'gemma4:e4b'
+    },
+    "cloud": {
+        "mini": 'gemma4:31b-cloud',
+        "big": 'qwen3.7-plus'
+    }
+}
+
+def AddToExpertAnswer(text: str, is_out: bool):
+    """
+    Кладем в глобальную переменную то, что нашли в RAG
+    """
+    global ADD_TO_EXPERT_ANSWER
+    if is_out == False:
+        ADD_TO_EXPERT_ANSWER = text
+
+def getAddedToExpertAnswerText():
+    global ADD_TO_EXPERT_ANSWER
+    for i in ADD_TO_EXPERT_ANSWER:
+        yield i
+
+def PrepareAnswer(query: str, chatHistory: list[dict]):
+    st.session_state['local'] = checkInternet()
+
+    # Промпт для Цензора (Проверка релевантности и RAG)
+    censor_prompt = f"""
+        Инструкция: Ты — диспетчер запросов для ИИ-эксперта по подбору запасных частей для тракторной и автомобильной техники.
+        Твоя задача — проанализировать запрос пользователя и определить, относится ли он к теме запчастей.
+
+        Правила:
+        1. Если запрос касается подбора деталей, технических характеристик, совместимости запчастей или поиска каталогов — запрос БЕЗОПАСЕН (is_safe: true).
+        2. Если запрос полностью не связан с темой техники и запчастей (например, просят написать стих, решить задачу по математике или дать совет по кулинарии) — запрос НЕБЕЗОПАСЕН (is_safe: false). В этом случае ничего не пиши, отправь пустой ответ (answer: "").
+        3. Определи, нужен ли RAG (поиск по базе знаний). RAG нужен, если запрос содержит: конкретные артикулы, названия моделей техники, требования к ГОСТам или поиск конкретных цен. Если это общий вопрос о том, как работает деталь — RAG не нужен.
+        4. Если запрос содержит конкретные артикулы или названия детали, добавь артикуль/деталь в json формат ("article" ) и/или названия модели техники добавь  в json формат (model: ...)
+        Запрос: {query}
+
+        Верни ТОЛЬКО JSON в формате, без markdown пометок об этом:
+        {{
+            "is_safe": true/false,
+            "answer": "текст ответа если is_safe=false, иначе пустая строка",
+            "needs_rag": true/false,
+            "article": "найденнный тобою артикуль",
+            "model": "найденная тобою модель трактора"
+        }}
+    """
+
+    messages = [{'role': 'user', 'content': censor_prompt}]
+    client = Client()
+
+    model_names = models['cloud']
+    if not st.session_state['local']:
+        model_names = models["local"]
+        client = Client('http://localhost:11434/')
+        print("Running in local mode")
+
+    mini_model = model_names['mini']
+    big_model = model_names['big']
+
+    try:
+        response_from_censor = client.chat(mini_model, messages=messages)
+        censor_answer_text = response_from_censor['message']['content']
+        print(f"Answer from censor: {censor_answer_text}")
+        routing_model = json.loads(censor_answer_text)
+    except Exception as e:
+        print(f"Censor error: {e}")
+        routing_model = {"is_safe": True, "needs_rag": False, "answer": ""}
+
+    if not routing_model.get('is_safe', True):
+        return routing_model.get('answer', "Извините, я могу помочь только с подбором запчастей.")
+
+    # Логика RAG (заглушка, так как поиск еще не реализован)
+    context = ""
+    part_group = ""
+    if routing_model.get('needs_rag'):
+        # Здесь в будущем будет вызов векторной базы
+        raw_context = QueryFinder(routing_model.get("article", query), "MTZ-82")
+        part_group = raw_context['text'] + f"Модель: {raw_context['metadata']['Модель']}\n Подгруппа деталей: {raw_context['metadata']['Подгруппа']}"
+        AddToExpertAnswer(part_group, False)
+        context = raw_context['Part']
+
+    # Промпт для основного Эксперта
+    expert_prompt = f"""
+        Роль: Ты — ведущий эксперт по подбору запасных частей для тракторов и сельскохозяйственной техники.
+        Твоя цель: помогать пользователям точно находить нужные детали, проверять совместимость и давать технические рекомендации.
+
+        Правила:
+        1. Опирайся на предоставленный контекст, если он есть.
+        2. Если ты не уверен в совместимости детали, обязательно предупреди пользователя об этом.
+        3. Не выдумывай несуществующие артикулы.
+        4. Ответ должен быть структурированным: Название детали -> Совместимость -> Рекомендация/Примечание.
+
+        Контекст из базы знаний:
+        <CONTEXT_START>
+        {context}
+        <CONTEXT_END>
+
+        Запрос пользователя: {query}
+    """
+
+    print(f"Модель используется локально: {st.session_state['local']}")
+    try:
+        if not st.session_state['local']:
+            client_qwen = OpenAI(base_url='http://localhost:11434/v1', api_key='ollama')
+        else:
+            client_qwen = OpenAI(
+                base_url='https://ws-5wyk7sdsfrh7lszk.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',
+                api_key=os.getenv("QWEN_API_KEY")
+            )
+
+        chat_history_copy = chatHistory.copy()
+        # Заменяем последний запрос на расширенный промпт эксперта
+        chat_history_copy[-1] = {"role": "user", "content": expert_prompt}
+
+        response = client_qwen.chat.completions.create(
+            model=big_model,
+            messages=chat_history_copy,
+            stream=True
+        )
+        return response
+    except Exception as e:
+        print(f"Expert model error: {e}")
+        return f"Произошла ошибка при генерации ответа: {e}"
+
+
+def concat_streams(query: str, chatHistory: list[dict]):
+    yield from PrepareAnswer(query, chatHistory)
+    yield from getAddedToExpertAnswerText()
+```
+
+
+
+### qdrant point:
+
+```
+{"text":" 1  **Деталь:** Опора  двигателя  передняя **Aртикуль:** 240-1001015- А1<br> 2  **Деталь:** Амортизатор  с ограничителем **Aртикуль:** 240-1001025<br> 3  **Деталь:** Болт **Aртикуль:** M8х16<br> 4  **Деталь:** 4 Шайба **Aртикуль:** ШП<br> 5  **Деталь:** Болт **Aртикуль:** M10х30<br> 6  **Деталь:** Шайба **Aртикуль:** ШП 10 <br> 7  **Деталь:** Опора  мacляного  картера **Aртикуль:** 50-1002042- В<br> 8  **Деталь:** Штифт **Aртикуль:** 240-1002044<br> 9  **Деталь:** Лист  задний **Aртикуль:** 50-1002313- В<br> 10  **Деталь:** Прокладка  корпуса  сальника **Aртикуль:** 50-1002316- А2<br> 11  **Деталь:** Фиксатор **Aртикуль:** 50-1002340<br> 12  **Деталь:** Щит распределения **Aртикуль:** 240-1002030<br> 13  **Деталь:** Прокладка  щита  распределения **Aртикуль:** 240-1002033<br> 14  **Деталь:** Штифт **Aртикуль:** 240-1002046<br> 15  **Деталь:** Прокладка **Aртикуль:** 240-1002049<br> 16  **Деталь:** Штифт **Aртикуль:** 240-1002044<br> 17  **Деталь:** Манжета  2.1-50x70-4 **Aртикуль:** 240-1002055<br> 18  **Деталь:** Крышка  распределения **Aртикуль:** 240-1002065- А2<br> 19  **Деталь:** Прокладка  крышки  распределения **Aртикуль:** 240-1002064- А<br> 20  **Деталь:** Прокладка  горловины **Aртикуль:** 240-1002082- А1<br> 21  **Деталь:** Сетка **Aртикуль:** 240-1002085<br> 22  **Деталь:** Патрубок **Aртикуль:** 240-1002088- В<br> 23  **Деталь:** Кольцо  пружинное **Aртикуль:** А19.01.003<br> 24  **Деталь:** Кольцо **Aртикуль:** 042-048-30-2-1<br> 25  **Деталь:** Пробка **Aртикуль:** А19.01.001<br> 26  **Деталь:** Болт **Aртикуль:** M8х20<br> 27  **Деталь:** Шайба **Aртикуль:** ШЧ 8 <br> 28  **Деталь:** Кольцо  маслоотражательное **Aртикуль:** 240-1002311<br> 29  **Деталь:** Корпус  сальника **Aртикуль:** 240-1002315<br> 30  **Деталь:** Манжета  1.1-100x125-4 **Aртикуль:** 240-1002305<br> 31  **Деталь:** Прокладка  листа  заднего **Aртикуль:** 240-1002314<br> 32  **Деталь:** Масломер **Aртикуль:** 240-1002320- В<br> 33  **Деталь:** Заглушка **Aртикуль:** 240-1002328<br> 34  **Деталь:** Штифт  установочный **Aртикуль:** 50-1002034<br> 35  **Деталь:** Рым **Aртикуль:** 50-1002318- Б<br> 36  **Деталь:** Заглушка **Aртикуль:** 50-1002326- В<br> 37  **Деталь:** Трубка **Aртикуль:** 240-1002323- Б<br> 38  **Деталь:** Пробка **Aртикуль:** 50-1002327- А<br> 39  **Деталь:** Блок  цилиндров **Aртикуль:** 240-1002015- А2-04<br> 40  **Деталь:** Втулка **Aртикуль:** 240-1002067- А<br> 41  **Деталь:** Втулка  задняя **Aртикуль:** 240-1002068- А<br>Прочее №1: 240-1001000- А 1 Установка  передней  опоры  (1-6) 240-1002000- Б 1 Блок  цилиндров  (7-73) 245-1002009-03 1 Блок  цилиндров  (38-48)<br>Прочее №2: 240-1001000- А 1 Установка  передней  опоры  (1-6) 240-1002000- Б 1 Блок  цилиндров  (7-73) 245-1002009-03 1 Блок  цилиндров  (38-48)<br>Прочее №2: 42 240-1002069- А 1 Втулка  передняя  10.1 43 50-1005140- Б 3 Крышка  коренного  подшипника<br> 44  **Деталь:** Крышка  1-го коренного  подшипника **Aртикуль:** 50-1005141- Б<br> 45  **Деталь:** Крышка  5-го коренного  подшипника **Aртикуль:** 50-1005152- В<br> 46  **Деталь:** Болт  крышки  коренного  подшипника **Aртикуль:** 50-1О05159-Б1<br> 47  **Деталь:** Шайба **Aртикуль:** 50-1005161<br> 48  **Деталь:** Заглушка **Aртикуль:** 45-08КП.Ц9.ХР<br>49 **Деталь:** Гильза  блока  цилиндров **Aртикуль:** 245-1002021- А1 или 245-1002021- А1-01 или 245-1002021- А1-02<br> 50  **Деталь:** Кольцо  гильзы **Aртикуль:** 50-1002022<br> 51  **Деталь:** Штифт **Aртикуль:** 50-1005019<br> 52  **Деталь:** Пробка **Aртикуль:** КГ 1/8\"А12.06<br> 53  **Деталь:** Кран **Aртикуль:** ПС7-0<br> 54  **Деталь:** Болт **Aртикуль:** M10х20<br> 55  **Деталь:** Болт **Aртикуль:** M10х25<br> 56  **Деталь:** Болт **Aртикуль:** M10х30<br> 57  **Деталь:** Болт **Aртикуль:** M10х45<br> 58  **Деталь:** Болт **Aртикуль:** M10х60<br> 59  **Деталь:** Болт **Aртикуль:** M10х75<br> 60  **Деталь:** Болт **Aртикуль:** M12х30<br> 61  **Деталь:** Болт **Aртикуль:** M12х35<br> 62  **Деталь:** 18 Шайба **Aртикуль:** ШП<br> 63  **Деталь:** 2 Шайба **Aртикуль:** ШП<br> 64  **Деталь:** 7 Шайба **Aртикуль:** ШП<br> 65  **Деталь:** Прокладка  люка **Aртикуль:** 240-1002038<br> 66  **Деталь:** Крышка  люка **Aртикуль:** 245-1002036<br> 67  **Деталь:** Кольцо  уплотнительное **Aртикуль:** 50-1022067<br>Прочее №2: 68 M8х30  Болт<br> 69  **Деталь:** Крышка **Aртикуль:** 240-1002062<br> 70  **Деталь:** Прокладка **Aртикуль:** 50-1021012<br> 71  **Деталь:** Болт **Aртикуль:** M6х16<br> 72  **Деталь:** 3 Шайба   10.1 **Aртикуль:** ШЧ<br>Прочее №2: 73 ШП 6 3 Шайба<br>","Part":"Деталь: Опора  двигателя  передняя Aртикуль: 240-1001015- А1","metadata":{"Модель":"МТЗ 82","Подгруппа":"Подгруппа  1001, 1002. Подвеска  и блок  цилиндров"}}
+```

@@ -1,0 +1,8 @@
+﻿id,373375
+apiKey,sk-ws-H.IPIIPR.KH2d.MEUCIC6pA5pjOD85mrfMMAwU1CRnCm9tPMFysu-X84_TSxzbAiEAvQqhFFiEGIhpwMtFcQ45GlCInX_2gTH6fjDNby6k_60
+apiHost,ws-5wyk7sdsfrh7lszk.ap-southeast-1.maas.aliyuncs.com
+openAiCompatible,https://ws-5wyk7sdsfrh7lszk.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+dashScope,https://ws-5wyk7sdsfrh7lszk.ap-southeast-1.maas.aliyuncs.com/api/v1
+description,Qwen 3.7
+workspaceName,Default Workspace
+workspaceId,ws-5wyk7sdsfrh7lszk
